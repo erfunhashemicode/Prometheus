@@ -1,4 +1,15 @@
-from dotenv import load_dotenv
+from flask import Flask
+import threading
+
+app_web = Flask(__name__)
+
+@app_web.route("/")
+def home():
+    return "Prometheus bot is running"
+
+def run_web():
+    app_web.run(host="0.0.0.0", port=8080)
+    from dotenv import load_dotenv
 load_dotenv()
 import os
 import logging
@@ -62,7 +73,13 @@ def main():
     app.add_handler(CommandHandler("nodes", nodes))
 
     logger.info("Bot starting (polling mode)...")
-    app.run_polling()
+
+threading.Thread(
+    target=run_web,
+    daemon=True
+).start()
+
+app.run_polling()
 
 
 if __name__ == "__main__":
