@@ -153,6 +153,26 @@ async def nodes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Defensive: if an older scraper.py (returning a plain list instead of
+    # a dict) ever ends up deployed, don't hard-crash — just degrade
+    # gracefully to "no metadata" instead of raising AttributeError.
+    if isinstance(result, dict):
+        pass
+    elif isinstance(result, list):
+        logger.warning(
+            "get_nodes() returned a list, not a dict — scraper.py looks "
+            "out of date. Update it to the version that returns a dict."
+        )
+        result = {
+            "nodes": result,
+            "fetched_at": "unknown (outdated scraper.py)",
+            "page_timestamp": None,
+            "source_url": None,
+        }
+    else:
+        logger.error("get_nodes() returned unexpected type: %r", type(result))
+        result = {"nodes": [], "fetched_at": "unknown", "page_timestamp": None, "source_url": None}
+
     all_nodes = result.get("nodes", [])
 
     if not all_nodes:
