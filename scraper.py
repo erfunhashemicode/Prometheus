@@ -6,16 +6,23 @@ The entry page (https://v2cross.com/en/free-v2ray-nodes/) links to a
 than hardcoding that link, we follow it from the entry page each run,
 so the scraper keeps working after they rotate it.
 
-The live page publishes node links as plain text lines starting with
-a known protocol prefix (vless://, vmess://, trojan://, ss://, ssr://).
-We match on those prefixes with a regex instead of relying on CSS
-classes, since the site's markup/theme can change but the link format
-is stable. We first look inside <pre>/<code> blocks (older layout),
-then fall back to the full page text (current layout, where nodes sit
-in a plain list) so the scraper keeps working either way.
+The live page's visible node list is only partially present in the raw
+HTML `requests.get()` returns -- most of it looks to be populated
+client-side via JavaScript after page load, which we can't execute.
+So instead of relying on the visible list, we primarily use the
+"subscription URL" the page also publishes as plain text (something
+like "订阅地址：https://.../pubconfig/XXXX"). That's the standard
+V2Ray/Clash subscription format: a base64 blob that decodes into the
+full newline-separated node list, meant to be machine-read by VPN
+clients -- so it's far more reliable to scrape than the rendered page.
+
+We still scrape the raw HTML for any inline node links too (belt and
+suspenders / older layout compatibility), and merge + de-duplicate
+both sources.
 """
 
 import re
+import base64
 import requests
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
@@ -41,6 +48,10 @@ PAGE_TIMESTAMP_RE = re.compile(
     r"(?:最近测速|最近更新)[：:]\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}(?:\s+\S+)?)"
 )
 
+# Matches the "订阅地址：https://.../pubconfig/XXXX" style line the page
+# publishes for importing the full node list into a VPN client.
+SUBSCRIPTION_URL_RE = re.compile(r"订阅地址[:：]?\s*(https?://\S+)")
+
 
 def _get_live_page_url() -> str:
     """Follow the 'Open latest node links' button from the entry page."""
@@ -61,11 +72,58 @@ def _get_live_page_url() -> str:
     return "https://v2cross.com/1884.html"
 
 
+def _extract_inline_nodes(search_text: str) -> list[str]:
+    """Node links that appear as plain text directly in the page HTML."""
+    nodes = NODE_LINE_RE.findall(search_text)
+    return [n.strip() for n in nodes if n.strip()]
+
+
+def _extract_subscription_nodes(search_text: str) -> list[str]:
+    """
+    Finds the page's published subscription URL, fetches it, and decodes
+    the base64 blob into individual node links. Returns [] if no
+    subscription URL is found or the fetch/decode fails for any reason
+    (deliberately swallowed here -- this is a best-effort supplement,
+    not the only source).
+    """
+    match = SUBSCRIPTION_URL_RE.search(search_text)
+    if not match:
+        return []
+
+    sub_url = match.group(1)
+
+    try:
+        resp = requests.get(sub_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        raw = resp.text.strip()
+
+        # Subscription payloads are base64 (sometimes urlsafe, sometimes
+        # missing padding) -- try standard first, then urlsafe, then pad.
+        decoded = None
+        for candidate in (raw, raw + "=" * (-len(raw) % 4)):
+            for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    decoded = decoder(candidate).decode("utf-8", errors="ignore")
+                    break
+                except Exception:
+                    continue
+            if decoded:
+                break
+
+        # If it wasn't base64 at all, the raw response might already be
+        # a plain node list -- fall back to using it directly.
+        text_to_scan = decoded if decoded else raw
+        return _extract_inline_nodes(text_to_scan)
+
+    except requests.RequestException:
+        return []
+
+
 def get_nodes():
     """
     Returns a dict:
         {
-            "nodes": list[str]          # raw node links, deduplicated, in page order
+            "nodes": list[str]          # raw node links, deduplicated, in discovery order
             "fetched_at": str           # UTC timestamp of when we scraped, ISO-ish
             "page_timestamp": str|None  # the site's own "last updated" timestamp, if found
             "source_url": str           # the live page we pulled nodes from
@@ -82,18 +140,22 @@ def get_nodes():
         soup = BeautifulSoup(resp.text, "lxml")
 
         # Prefer <pre>/<code> blocks if present (older layout); otherwise
-        # fall back to the whole page text (current layout: plain list).
+        # fall back to the whole page text (current layout).
         blocks = soup.find_all(["pre", "code"])
         search_text = "\n".join(b.get_text("\n") for b in blocks) or soup.get_text("\n")
 
-        nodes = NODE_LINE_RE.findall(search_text)
+        # Primary source: the published subscription URL (full list,
+        # not subject to whatever JS renders on the page). Supplement
+        # with any node links visible directly in the raw HTML.
+        subscription_nodes = _extract_subscription_nodes(search_text)
+        inline_nodes = _extract_inline_nodes(search_text)
 
-        # de-duplicate while preserving order
+        # de-duplicate while preserving order; subscription nodes first
+        # since that's the more complete/reliable source
         seen = set()
         unique_nodes = []
-        for n in nodes:
-            n = n.strip()
-            if n and n not in seen:
+        for n in subscription_nodes + inline_nodes:
+            if n not in seen:
                 seen.add(n)
                 unique_nodes.append(n)
 
