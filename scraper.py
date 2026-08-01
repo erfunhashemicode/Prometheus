@@ -6,19 +6,22 @@ The entry page (https://v2cross.com/en/free-v2ray-nodes/) links to a
 than hardcoding that link, we follow it from the entry page each run,
 so the scraper keeps working after they rotate it.
 
-The live page's visible node list is only partially present in the raw
-HTML `requests.get()` returns -- most of it looks to be populated
-client-side via JavaScript after page load, which we can't execute.
-So instead of relying on the visible list, we primarily use the
-"subscription URL" the page also publishes as plain text (something
-like "订阅地址：https://.../pubconfig/XXXX"). That's the standard
-V2Ray/Clash subscription format: a base64 blob that decodes into the
-full newline-separated node list, meant to be machine-read by VPN
-clients -- so it's far more reliable to scrape than the rendered page.
+IMPORTANT QUIRK: the site is behind Cloudflare, which automatically
+"protects" any text that looks like an email address (word@word) by
+replacing it with a <a class="__cf_email__" data-cfemail="HEX">[email
+protected]</a> placeholder. Since our node links are formatted like
+ss://<base64>@host:port or vless://<uuid>@host:port, Cloudflare's
+pattern matches them and mangles the @host part of almost every node.
+The real text is only restored client-side by a JS snippet, which we
+don't execute. Instead, we decode Cloudflare's email obfuscation
+ourselves -- it's a simple, documented XOR cipher -- and splice the
+real text back in before extracting nodes. Without this step, most
+node lines come back empty or truncated.
 
-We still scrape the raw HTML for any inline node links too (belt and
-suspenders / older layout compatibility), and merge + de-duplicate
-both sources.
+We also read text out of <pre>/<code> blocks with NO separator
+(BeautifulSoup's default), since a separator like "\\n" would inject
+artificial newlines around every inline tag (like the cf_email spans),
+splitting single node lines into fragments.
 """
 
 import re
@@ -51,6 +54,34 @@ PAGE_TIMESTAMP_RE = re.compile(
 # Matches the "订阅地址：https://.../pubconfig/XXXX" style line the page
 # publishes for importing the full node list into a VPN client.
 SUBSCRIPTION_URL_RE = re.compile(r"订阅地址[:：]?\s*(https?://\S+)")
+
+
+def _decode_cf_email(hex_string: str) -> str:
+    """
+    Decodes Cloudflare's email-obfuscation encoding. The first byte is
+    an XOR key; every subsequent byte, XORed with that key, gives one
+    character of the original text.
+    """
+    key = int(hex_string[:2], 16)
+    return "".join(
+        chr(int(hex_string[i:i + 2], 16) ^ key)
+        for i in range(2, len(hex_string), 2)
+    )
+
+
+def _unmask_cf_emails(soup: BeautifulSoup) -> None:
+    """
+    Finds every Cloudflare email-obfuscation placeholder in the soup
+    and replaces it in-place with its decoded plain text, so the
+    surrounding node link (ss://...@host or vless://...@host) is whole
+    again before we try to extract it. Mutates soup; returns nothing.
+    """
+    for tag in soup.select("a.__cf_email__[data-cfemail]"):
+        try:
+            decoded = _decode_cf_email(tag["data-cfemail"])
+        except (KeyError, ValueError):
+            continue
+        tag.replace_with(decoded)
 
 
 def _get_live_page_url() -> str:
@@ -139,16 +170,31 @@ def get_nodes():
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Prefer <pre>/<code> blocks if present (older layout); otherwise
-        # fall back to the whole page text (current layout).
+        # Undo Cloudflare's email obfuscation BEFORE extracting any
+        # text -- otherwise every ss://...@host / vless://...@host
+        # link comes back mangled or truncated.
+        _unmask_cf_emails(soup)
+
+        # Full page text (with separators -- fine for general prose)
+        # is used for metadata like the subscription URL and "last
+        # updated" timestamp, since those live outside the <pre> block
+        # on this site (e.g. in a <h5> and <time> tag elsewhere).
+        full_page_text = soup.get_text("\n")
+
+        # Node links specifically live inside <pre class="v2cross-live-
+        # node-list"> (or <code>, on older layouts). Use NO separator
+        # here (BeautifulSoup's default) so we don't inject artificial
+        # newlines around inline tags (like the cf_email spans) and
+        # split single node lines apart. Fall back to the full page
+        # text if no pre/code block exists at all.
         blocks = soup.find_all(["pre", "code"])
-        search_text = "\n".join(b.get_text("\n") for b in blocks) or soup.get_text("\n")
+        node_search_text = "\n".join(b.get_text() for b in blocks) or full_page_text
 
         # Primary source: the published subscription URL (full list,
         # not subject to whatever JS renders on the page). Supplement
         # with any node links visible directly in the raw HTML.
-        subscription_nodes = _extract_subscription_nodes(search_text)
-        inline_nodes = _extract_inline_nodes(search_text)
+        subscription_nodes = _extract_subscription_nodes(full_page_text)
+        inline_nodes = _extract_inline_nodes(node_search_text)
 
         # de-duplicate while preserving order; subscription nodes first
         # since that's the more complete/reliable source
@@ -159,7 +205,7 @@ def get_nodes():
                 seen.add(n)
                 unique_nodes.append(n)
 
-        page_ts_match = PAGE_TIMESTAMP_RE.search(search_text)
+        page_ts_match = PAGE_TIMESTAMP_RE.search(full_page_text)
         page_timestamp = page_ts_match.group(1) if page_ts_match else None
 
         return {
